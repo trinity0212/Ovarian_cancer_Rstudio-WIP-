@@ -1,0 +1,129 @@
+---
+title: "Independent Project"
+author: "Trinity SHI"
+date: "November 9 2025"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+Day 1:
+
+Today, my goal is to review statistical tests (normality → parametric vs. non-parametric → two-group comparisons) while also learning more about the seqinr package and creating some sequencing-related functions. I will also continue progressing through the online course.
+
+I will start by loading the necessary packages:
+```{r}
+library(seqinr)
+library(ggplot2)
+library(tidyr)
+library(dbplyr)
+library(Biostrings)
+```
+
+I am particularly interested in researching ovarian cancer, as it has affected several generations in my family. So I've gone ahead and downloaded the FASTA file of Human Metastatic Ovarian Cancer Homo sapiens from GenBank. 
+```{r}
+ov_data <- read.fasta(file = "ovarian_sequence.fasta", seqtype = "DNA", as.string = TRUE, legacy.mode = TRUE, seqonly = TRUE, strip.desc = TRUE, whole.header = TRUE)
+#there are some Ns in the data, they represent amibiguous nucleotides and gaps. So I can't remove the Ns
+
+norm_data <-read.fasta(file = "TIE1_sequence.fasta", seqtype = "DNA", as.string = TRUE, legacy.mode = TRUE, seqonly = TRUE, strip.desc = TRUE, whole.header = TRUE)
+
+data <-read.fasta(file = "TIE1_sequence.fasta copy", seqtype = "DNA", as.string = TRUE, legacy.mode = TRUE, seqonly = TRUE, strip.desc = TRUE, whole.header = TRUE)
+```
+
+I would like to compare the DNA sequence of a healthy individual with that of an individual affected by ovarian cancer, and identify what genetic changes contributed to the development of the cancer. Although I already have a biological understanding of the mechanisms involved, I believe that analyzing the differences computationally will deepen my understanding.
+
+I need to identify this marker in a normal individual using BLAST so that I can determine the gene’s location. After running BLAST, I found that the sequence maps to TIE1, a tyrosine kinase gene. This makes sense biologically, because tyrosine kinases play key roles in angiogenesis (the growth of new blood vessels), remodeling of the tumor microenvironment, and promoting cancer cell survival and invasion. These processes are all strongly associated with the progression and metastasis of ovarian cancer.
+
+From what I’ve learned, I will begin by performing a sanity check and then run a local alignment. Since I am comparing a short fragment to a full-length sequence (702 bp vs. 29216 bp), I first need to remove any adapters, primers, and other sequencing artifacts before interpreting the alignment.
+It has come to my knowledge that the most common sequence alignment package I can do in R is contained in a package called Biostring so I will go ahead and download the package and perform the local alignment. 
+```{r}
+#First Identify the length of each seq
+ov_length <- nchar(ov_data)
+norm_length <- nchar(norm_data)
+```
+Note not for this time: 
+We need to remove repeating sequences such as “AAAAAAAAA…” (poly-A tails) because this ovarian sequence is derived from cDNA. When mRNA is processed in the cell, it naturally ends with a long chain of adenine nucleotides known as the poly-A tail. In the complementary orientation, this appears as a long run of thymine bases (poly-T). These tails are not part of the actual gene sequence, so they must be trimmed before alignment.
+```{r}
+ov_str <- as.character(ov_data)
+norm_str <- as.character(norm_data)
+
+cancer <- DNAString(ov_str)
+normal <- DNAString(norm_str)
+
+align_forward <- pairwiseAlignment(pattern = cancer, subject = normal, type="local")
+align_reverse <- pairwiseAlignment(patter = reverseComplement(cancer), subject = normal, type="local")
+
+forward_score <- score(align_forward)
+reverse_score <- score(align_reverse)
+
+```
+Chunk by Chunk explanantion: 
+1) read.fasta() returns a list of characters =, but DNAstring() will only take strings, so I converted the data into String. 
+2) DNAString() is a specialized method that stores DNA sequences, with a predefined rule for the nucleotides((A, C, G, T).
+3) pairwiseAlignment() finds the optimal alignment between cancer and normal, by scoring matches, mismatches, and gaps. I will be doing local alignment (waterman) first. I then used the reverseComplement() function to generate the reverse-complement of the cancer sequence. This allowed me to compare both orientations (forward and reverse) against the normal TIE1 reference sequence. 
+4) By comparing the local alignment scores of each orientation, I can determine whether the cancer fragment should be analyzed as-is or in reverse-complement orientation in regards to the normal. The grades indicate that the fragment can be read as-is. 
+
+I did local first to find the best window for the comparison, I can proceed with a global alignment. 
+```{r}
+# Get the start and end positions of the local alignment
+ref_start <- start(subject(align_forward)) 
+ref_end   <- end(subject(align_forward))
+
+# it was behaving really weird without subject() but with subject it is asking -> “Where does the tumor fragment align on the reference transcript(normal)?”
+
+window <- ref_end - ref_start +1 
+
+#Now I'm going to extract the subsequence from the norm
+normal <- subseq(normal, start = ref_start, end = ref_end)
+
+align_global <- pairwiseAlignment(cancer, normal, type="global")
+pid <- pid(align_global, type = "PID1") # corresponds to BLAST result, 98% sequence identity. 
+
+```
+I performed a global alignment and then built a difference table to classify mismatches (same position, different base) and indels (insertions/deletions represented by a “-” gap in either sequence). Note that “N” is an ambiguous nucleotide and potentially a gap.
+
+Line by Line explanation of what I did:
+1) subject() extracts the reference sequence (normal seq) from the alignment object. start() / end() give the coordinates on the reference where the local hit lands.
+2) Length of the matched window on the reference. +1 because indices are inclusive (R is 1-based).
+3) Then the next pairwiseAlignment(), slices the reference to the matched window.
+4) pid() Computes percent identity of the global alignment.
+
+```{r}
+#I will need to find the subseq in frag as well, I can not use subseq because the start_ref do not refer to the position in frag so I need use substr
+cancer_window<- strsplit(as.character(pattern(align_global)), "")[[1]] #Need [[1]], because conversion.
+normal_window <- strsplit(as.character(subject(align_global)),"")[[1]]
+
+#The following steps contains help from internet and Chat bot, I was just very confused
+
+ref_position <- cumsum(normal_window != "-") + ref_start - 1 #this creates a vector that contains the vector of each coordinate 
+ref_position[normal_window == "-"] <- NA
+
+type <- ifelse(cancer_window == "-" | normal_window == "-", "indel", 
+               ifelse(cancer_window != normal_window, "mismatch", "match"))
+
+#create the table
+dif_table <- data.frame(position = ref_position, normal = normal_window, cancer = cancer_window, type = type)
+dif_table
+
+```
+Line by line explanation: 
+1) cumsum() ounts how many real reference bases have appeared so far → converts alignment index → transcript position.(normal_window != "-")creates a TRUE/FALSE vector that marks real bases in the reference. + ref_start - 1 Anchors those positions back to the original reference coordinate system.
+Todler 1) 
+Think of reading the normal sequence one letter at a time:
+
+Every time you see a real letter (A, C, G, or T), you count up.
+
+Every time you see a dash ("-"), you do NOT count up.
+
+This is what cumsum(normal_window != "-") does:
+It counts only the real letters, not the gaps.
+
+2) ref_position[normal_window == "-"] <- NA Positions where the reference has a gap get no coordinate → makes sense (you cannot map a gap to a chromosome position).
+
+
+Now I would like to translate the sequence into protein:
+```{r}
+aa_ref <- as.character(translate(DNAString(codon_ref)))
+aa_mut <- as.character(translate(DNAString(codon_mut)))
+```
+
